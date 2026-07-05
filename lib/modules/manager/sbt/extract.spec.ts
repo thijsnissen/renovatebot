@@ -4,6 +4,7 @@ import { fs } from '~test/util.ts';
 import {
   extractPackageFile as extract,
   extractAllPackageFiles,
+  resolve,
 } from './extract.ts';
 
 vi.mock('../../../util/fs/index.ts');
@@ -153,6 +154,101 @@ describe('modules/manager/sbt/extract', () => {
         managerData: {
           scalaVersion: undefined,
         },
+      });
+    });
+
+    it('skips deps when a longer dotted path resolves only to an intermediate value', () => {
+      const content = codeBlock`
+        object Version {
+          val avro = "1.2.3"
+        }
+        libraryDependencies += "org.apache.avro" % "avro" % Version.avro.missing
+      `;
+      expect(extractPackageFile(content)).toMatchObject({
+        deps: [
+          {
+            packageName: 'org.apache.avro:avro',
+            currentValue: undefined,
+          },
+        ],
+      });
+    });
+
+    it('resolves a dotted alias to another object member', () => {
+      const content = codeBlock`
+        object Version {
+          val avro = "1.2.3"
+        }
+        val avroVersion = Version.avro
+        libraryDependencies += "org.apache.avro" % "avro" % avroVersion
+      `;
+      expect(extractPackageFile(content)).toMatchObject({
+        deps: [
+          {
+            packageName: 'org.apache.avro:avro',
+            currentValue: '1.2.3',
+            sharedVariableName: 'avroVersion',
+          },
+        ],
+      });
+    });
+
+    it('resolves a chained alias regardless of declaration order', () => {
+      const content = codeBlock`
+        libraryDependencies += "org.apache.avro" % "avro-tools" % avroVersionAlias
+        val avroVersionAlias = avroVersion
+        val avroVersion = Version.avro
+        object Version {
+          val avro = "1.2.3"
+        }
+      `;
+      expect(extractPackageFile(content)).toMatchObject({
+        deps: [
+          {
+            packageName: 'org.apache.avro:avro-tools',
+            currentValue: '1.2.3',
+            sharedVariableName: 'avroVersionAlias',
+          },
+        ],
+      });
+    });
+
+    it('resolves a member inherited from an extended trait', () => {
+      const content = codeBlock`
+        trait Version {
+          val avro = "1.2.3"
+        }
+        object Dependencies extends Version {
+          libraryDependencies += "org.apache.avro" % "avro" % avro
+        }
+      `;
+      expect(extractPackageFile(content)).toMatchObject({
+        deps: [
+          {
+            packageName: 'org.apache.avro:avro',
+            currentValue: '1.2.3',
+            sharedVariableName: 'Version.avro',
+          },
+        ],
+      });
+    });
+
+    it('resolves a member brought into scope by a wildcard import', () => {
+      const content = codeBlock`
+        object Version {
+          val avro = "1.2.3"
+        }
+        import Version._
+        libraryDependencies += "org.apache.avro" % "avro" % avro
+      `;
+      expect(extractPackageFile(content)).toMatchObject({
+        deps: [
+          {
+            packageName: 'org.apache.avro:avro',
+            currentValue: '1.2.3',
+            sharedVariableName: 'Version.avro',
+          },
+        ],
       });
     });
 
@@ -640,6 +736,77 @@ describe('modules/manager/sbt/extract', () => {
       expect(packages).toBeEmpty();
     });
 
+    it('skips build.properties without an sbt version', async () => {
+      fs.readLocalFile.mockResolvedValueOnce(codeBlock`
+        another.conf=1.4.0
+      `);
+      const packages = await extractAllPackageFiles({}, [
+        'project/build.properties',
+      ]);
+      expect(packages).toBeEmpty();
+    });
+
+    it('resolves a version defined in a sibling file within the same directory', async () => {
+      fs.readLocalFile
+        .mockResolvedValueOnce(
+          codeBlock`
+            object Version {
+              val avro = "1.2.3"
+            }
+          `,
+        )
+        .mockResolvedValueOnce(
+          codeBlock`
+            libraryDependencies += "org.apache.avro" % "avro" % Version.avro
+          `,
+        );
+      const packages = await extractAllPackageFiles({}, [
+        'project/Version.scala',
+        'project/Dependencies.scala',
+      ]);
+      expect(packages).toMatchObject([
+        {
+          packageFile: 'project/Dependencies.scala',
+          deps: [
+            {
+              packageName: 'org.apache.avro:avro',
+              currentValue: '1.2.3',
+              sharedVariableName: 'Version.avro',
+            },
+          ],
+        },
+      ]);
+    });
+
+    it('does not resolve a version defined in a different directory', async () => {
+      fs.readLocalFile
+        .mockResolvedValueOnce(
+          codeBlock`
+            val avro = "1.2.3"
+          `,
+        )
+        .mockResolvedValueOnce(
+          codeBlock`
+            libraryDependencies += "org.apache.avro" % "avro" % avro
+          `,
+        );
+      const packages = await extractAllPackageFiles({}, [
+        'a/build.sbt',
+        'b/build.sbt',
+      ]);
+      expect(packages).toMatchObject([
+        {
+          packageFile: 'b/build.sbt',
+          deps: [
+            {
+              packageName: 'org.apache.avro:avro',
+              currentValue: undefined,
+            },
+          ],
+        },
+      ]);
+    });
+
     it('extracts build properties correctly', async () => {
       const buildProps = codeBlock`
       sbt.version=1.6.0
@@ -664,6 +831,96 @@ describe('modules/manager/sbt/extract', () => {
           ],
         },
       ]);
+    });
+  });
+
+  describe('unresolvable symbols', () => {
+    it('does not emit a scala dep for an unresolvable scalaVersion symbol', () => {
+      const content = codeBlock`
+        scalaVersion := unknownScalaVersion
+        libraryDependencies += "org.apache.avro" % "avro" % "1.2.3"
+      `;
+      const res = extract(content, 'build.sbt');
+      expect(res?.deps).not.toContainEqual(
+        expect.objectContaining({ depName: 'scala' }),
+      );
+    });
+
+    it('leaves packageFileVersion undefined for an unresolvable version symbol', () => {
+      const content = codeBlock`
+        version := unknownVersion
+        libraryDependencies += "org.apache.avro" % "avro" % "1.2.3"
+      `;
+      expect(extract(content, 'build.sbt')?.packageFileVersion).toBeUndefined();
+    });
+
+    it('leaves an unresolvable artifactId symbol undefined', () => {
+      const content = codeBlock`
+        libraryDependencies += "org.apache.avro" % unknownArtifact % "1.2.3"
+      `;
+      expect(extract(content, 'build.sbt')?.deps).toMatchObject([
+        { depName: 'org.apache.avro:undefined' },
+      ]);
+    });
+
+    it('ignores a resolver with an invalid URL', () => {
+      const content = codeBlock`
+        resolvers += "my-repo" at "not a url"
+        libraryDependencies += "org.apache.avro" % "avro" % "1.2.3"
+      `;
+      expect(extract(content, 'build.sbt')?.deps).toMatchObject([
+        { registryUrls: [] },
+      ]);
+    });
+  });
+
+  describe('resolve', () => {
+    it('passes through a simple val', () => {
+      expect(resolve({ vals: { avro: '1.2.3' }, aliases: {} })).toEqual({
+        avro: '1.2.3',
+      });
+    });
+
+    it('resolves a single alias to its target literal', () => {
+      expect(
+        resolve({ vals: { avro: '1.2.3' }, aliases: { avroAlias: 'avro' } }),
+      ).toEqual({ avro: '1.2.3', avroAlias: '1.2.3' });
+    });
+
+    it('resolves a chained alias regardless of declaration order', () => {
+      expect(
+        resolve({ vals: { c: '1' }, aliases: { a: 'b', b: 'c' } }),
+      ).toEqual({ c: '1', a: '1', b: '1' });
+    });
+
+    it('omits an alias with a missing target', () => {
+      expect(resolve({ vals: {}, aliases: { a: 'missing' } })).toEqual({});
+    });
+
+    it('omits both keys on a cycle without hanging', () => {
+      expect(resolve({ vals: {}, aliases: { a: 'b', b: 'a' } })).toEqual({});
+    });
+
+    it('keeps both bare and qualified keys', () => {
+      expect(
+        resolve({
+          vals: { avro: '1.2.3', 'Version.avro': '1.2.3' },
+          aliases: {},
+        }),
+      ).toEqual({ avro: '1.2.3', 'Version.avro': '1.2.3' });
+    });
+
+    it('returns an empty map for an empty table', () => {
+      expect(resolve({ vals: {}, aliases: {} })).toEqual({});
+    });
+
+    it('resolves resolvable aliases while omitting unresolvable ones', () => {
+      expect(
+        resolve({
+          vals: { avro: '1.2.3' },
+          aliases: { good: 'avro', bad: 'missing' },
+        }),
+      ).toEqual({ avro: '1.2.3', good: '1.2.3' });
     });
   });
 });
